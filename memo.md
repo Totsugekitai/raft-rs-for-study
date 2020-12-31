@@ -72,3 +72,55 @@ raftを実装する上での論文メモです。
 
 ### Raft basics
 
+- 各ノードのstateはleader,follower,candidate
+  - leaderは1ノード、followerはleader以外のノード
+- followerはleaderからの応答のみを行う
+- candidateはelection時に全ノードがなる状態
+
+- 時間をtermという区切りで管理する
+- 各termはelectionから始まる
+- electionで新しいleaderが選出されたらnormal operationが続く
+- leaderに障害が起きたら次のtermに遷移する
+- 各ノードは別ノードのterm値を監視して、遷移があったら自身のterm値を更新する
+
+- Raftを実現するRPCは2つ
+  - RequestVote RPC
+    - candidateが発するRPC
+  - AppendEntries RPC
+    - leaderが発し、followerが返答することでハートビートの役割を兼任する
+
+### Leader election
+
+- 各ノードのスタートアップ時は、followerから始まる
+- leaderかcandidateから有効なRPCを受け取るまで、followerを維持する
+- leaderは定期的にハートビートを送り、権限管理する
+  - log entriesが無いAppendEntries RPCをハートビートとする
+- 一定期間ハートビートを受け取らなかった際(election timeoutという)、followerはleaderがいないと仮定し、electionを開始する
+
+- electionを開始する際、以下のことを行う
+  - current termをインクリメント
+  - candidateに遷移
+- 自身にvoteするのと他ノードにRequestVote RPCを送るのを並列に行う
+- candidateは以下のうち1つが起こるまで、candidateの状態を継続する
+  - 自身がelectionに勝つ
+  - 他ノードがleaderとして確立したことが確認される
+  - 一定時間leaderが現れなかった
+
+- 1つのcandidateに対してクラスタ中の過半数のノードから投票が同一term内であった場合、electionに勝ったとする
+- 同一term内において、各サーバは多くても1つのノードに対してvoteを行う
+  - 最初に来たものに最初に(voteを)返す方式
+- leaderになったノードは、ハートビートを他ノードに送り、権限管理とelectionの抑制を行う
+
+- voteを待っている間、candidateは自分がleaderだと主張するノードからAppendEntried RPCを受け取る可能性がある
+  - そのleaderのterm値がcandidateのterm値以上の場合は、そのノードを正当なleaderだと認識し、自身の状態をfollowerに遷移させる
+  - そのleaderのterm値がcandidateのterm値未満の場合は、RPCを否認しcandidate状態を継続する
+
+- voteに勝ちも負けもせず、一定時間が経過したとき
+  - 新たにelectionを開始する
+    - candidateはterm値をインクリメントして新たにRequestVote RPCを別ノードに送る
+
+- election timeoutにランダムな値を用いる
+  - ある一定区間の時間からランダムで時間を決定する(e.g. 150-300ms)
+  - 多くの場合1つのノードのみがtime outする
+    - ノードがelectionに勝ち、他ノードがtime outするまでにハートビートを送り始める
+
