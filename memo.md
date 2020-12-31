@@ -124,3 +124,59 @@ raftを実装する上での論文メモです。
   - 多くの場合1つのノードのみがtime outする
     - ノードがelectionに勝ち、他ノードがtime outするまでにハートビートを送り始める
 
+### Log replication
+
+- leaderが選ばれたら、クライアントのリクエストを受け付けるようになる
+- 各クライアントのリクエストは各ノードのreplicated state machineが実行するcommandが含まれている
+- leaderは新たなエントリとしてlogに対してcommandを付け足し、各ノードに複製するためにAppendEntries RPCを送る
+- 安全に複製された場合、leaderはエントリをstate machineに適用し、結果をクライアントに返却する
+- followerがクラッシュしたり、実行が遅かったり、パケットがロストしたりした場合は、leaderはAppendEntries RPCを無制限に再送する
+  - クライアントにレスポンスした後でも、すべてのfollowerが全てのlog entryを保存するまで繰り返される
+
+- logはstate machine commandがterm値とともに書き込まれる
+  - term値はleaderからエントリを受け取った際のもの
+- term値はlogと図3のプロパティの不一貫性の検査に用いられる
+- 各logエントリは整数のインデックスを持ち、log中の位置を表す
+
+- leaderはいつlogをstate machineに適用するのが安全か決定する
+  - (安全だと判断された？)エントリは `committed` と呼ばれる
+- Raftはcommitedなエントリは耐久性を持ち、全ての利用可能なstate machineにおいて順番に実行されることが保証される
+- 生成されたエントリが過半数のノードで複製されるとleaderによりcommitされる
+  - leaderのlogにおいてcommitされたエントリよりも先行するlogエントリもcommitされる
+  - 前のleaderによってcommitされたエントリも含む
+- ココらへんの微妙なルールや安全性についての議論は5.4節で説明する
+- leaderはcommitされたエントリのインデックスは最も高いものを保持する
+  - これは未来にAppendEntries RPC(ハートビート含む)で送られるものも含む
+  - 他ノードも順序が理解できるようになっている
+- あるlogエントリがcommitされたものだとfollowerが知ると、ローカルのstate machineに適用する
+
+- 違ったlog中で同じインデックスと同じtermを持った2つのentryができてしまった場合
+  - 同じcommandをストアする
+    - leaderは最高でも1termで与えられたlogインデックスにつき1つのエントリしか生成しない
+    - logエントリはlog中の位置を変えることはない
+  - logは全ての先行するエントリに対して識別可能である
+    - AppendEntries RPCにより保証される
+      - AppendEntries RPCが送られる際、leaderはlogのインデックスとエントリのtermを含ませる
+        - これは新たなエントリの直後に先行するlogである
+- followerがlog中に同じインデックスとtermを見つけられなかった際は、新しいエントリを否認する
+
+- 通常のオペレーション中は、leaderとfollowerのlogは一貫性が保たれる
+  - この際のAppendEntriesの一貫性チェックは失敗することはない
+- leaderがクラッシュした際は、一貫性が保てなくなる
+  - 古いleaderは全てのエントリの複製を持っていないかもしれない
+  - leaderのみならずfollowerのクラッシュも招く可能性あり
+
+- Raftはこれらの不一貫性を、followerのlogに対してleaderの複製をもたせることで解決している
+  - followerのlogでコンフリクトが起きた場合には、leaderのlogを上書きする
+
+- followerのlogが一貫性を保つためにleaderは以下を満たさなければならない
+  - 2つのlogが合意する最も最近のlogエントリを見つける
+  - そのポイントより後のlogエントリを削除する
+  - そのポイントより後のleaderのlogエントリをfollowerに送る
+- これらはAppendEntries RPCの一貫性チェックで行われる
+- leaderは `nextIndex` を各followerに対して整備する必要がある
+  - これはleaderがfollowerに対して送る次のlogエントリのインデックス
+- leaderが初めて実権を握った際には、全てのnextIndexの値をlog中の最後の一つのエントリのインデックス+1したものに初期化する
+- followerのlogがleaderと一貫していない場合、AppendEntriesの一貫性チェックは次のAppendEntries RPCで失敗する
+- 拒否された後は、leaderはnextIndexの値をデクリメントし、AppendEntries RPCを再送する
+  - これを繰り返すことで、leaderとfollowerのlogが一貫するポイントまで戻ることになる
