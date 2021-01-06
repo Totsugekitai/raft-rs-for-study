@@ -32,6 +32,7 @@ raftを実装する上での論文メモです。
 - Replicated state machines は replicated log を用いて実装されることが多い
 - Figure 1の例を見る
   - 各サーバはlogをストアする
+    - ここでのlogはデータベースのlogだったり、設定ファイルだったり、様々である
     - logにはcommand(おそらく命令のこと)列が格納されている
       - 各サーバの各logは同じcommand列が同じ順番で格納される
         - これにより各サーバは同じcommandを同じ順番で実行する
@@ -40,7 +41,7 @@ raftを実装する上での論文メモです。
   - サーバ内のconsensus moduleがクライアントからのcommandを受け取ってlogに追加する
   - consensus module同士が通信して、サーバがダウンしてもlogの一貫性を保つ必要がある
   - commandが複製された後に、各サーバのstate machineがlogに格納されている順番に計算を行い、クライアントに出力を返す
-- ビザンチン状態(結託して過半数が嘘をつくような状態)ではない条件下で、safetyが保たれる
+- ビザンチン状態(一貫しない応答をされる)ではない条件下で、safetyが保たれる
   - 以下の障害に耐性を持つ
     - ネットワーク遅延
     - 分断
@@ -69,6 +70,130 @@ raftを実装する上での論文メモです。
   - leaderは各サーバと相談を必要とせずにログエントリをlog内に格納できる
   - データフローはleaderから各サーバのみ
 - leaderに障害または疎通が取れなくなったら、新しいleaderの選出が始まる
+
+### Figure 2のまとめ
+
+#### State
+
+##### Persistent state on all servers
+これらはRPCの返答前にストレージをアップデートする
+
+- currentTerm
+  - サーバが観測した最後のterm
+  - 初期値は0
+- votedFor
+  - 現在のtermで投票してくれたcandidateIdが格納される
+  - なかったらnullが入る
+- log[]
+  - logのエントリが入る
+  - state machineに対するコマンドがlogエントリ
+  - またleaderからlogを受け取ったときのtermも格納される
+
+##### Volatile state on all servers
+
+- commitIndex
+  - **commitされたとわかっている** 一番大きいlogエントリのインデックス
+- lastApplied
+  - **state machineに適用した** 一番大きいlogエントリのインデックス
+
+##### Volatile state on leaders
+electionの後に再初期化する
+
+- nextIndex[]
+  - 各サーバに対して送る、次のlogエントリのインデックス
+    - leaderの最後のlogインデックス+1
+- matchIndex[]
+  - 各サーバに対して送る、**複製されたとわかっている** 最も大きいlogエントリのインデックス
+
+#### AppendEntries RPC
+logエントリを複製するためのRPC。
+ハートビートにも用いられる。
+
+- Arguments
+  - term
+    - **leaderの** term
+  - leaderId
+    - followerがclientにリダイレクトする場合
+  - prevLogIndex
+    - 新しいlogエントリのすぐ手前のインデックス
+  - prevLogTerm
+    - prevLogIndexのterm値
+  - entries[]
+    - ストアするlogエントリ
+      - 空のときはハートビート
+      - 1つ以上送るとlogの複製
+  - leaderCommit
+    - leaderのcommitIndex
+- Results
+  - term
+    - 現在のterm値
+      - leaderがアップデートするのに用いる
+  - success
+    - followerがprevLogIndexとprevLogTermが一致したエントリを格納したらtrueが入る
+- Receiver Implementation
+  1. `if (term < currentTerm) return false;`
+  2. `if (entries[prevLogIndex].term != prevLogTerm) return false;`
+  3. 既存のlogと新しいlogがコンフリクトしたら、新しい方に合わせる
+  4. 既存のlogに無いlogエントリを適用する
+  5. `if (leaderCommit > commitIndex) commitIndex = min(leaderCommit, index of last new entry);`
+
+#### RequestVote RPC
+candidateが投票を集めるために発するRPC
+
+- Arguments
+  - term
+    - **candidateの** term値
+  - candidateId
+    - 投票をリクエストしているcandidateのID
+  - lastLogIndex
+    - candidateの最後のlogのインデックス
+  - lastLogTerm
+    - candidateの最後のlogのterm値
+- Results
+  - term
+    - currentTerm
+      - candidateが自身のtermをアップデートするために用いる
+  - voteGranted
+    - trueだと投票を受け取ったという意味
+- Receiver Implementation
+  1. `if (term < currentTerm) return false;`
+  2. `if ((votedFor == null || votedFor == candidateId) &&
+         (candidate's log is at least as up-to-sate as receiver's log)) voteGranted = true;`
+
+#### Rules for Servers
+
+##### All Servers
+
+- `if (commitIndex > lastApplied) { lastApplied++; apply_to_state_machine(log[lastApplied]); }`
+- `if (RPC request or response contains term T > currentTerm) { currentTerm = T; convert to candidate; }`
+
+##### Followers
+
+- candidateとleaderに対してRPCの返答をする
+- leaderからAppendEntries RPCが来なかったり、candidateから投票されなかったりしてelectionが経過した場合、candidateに遷移
+
+##### Candidates
+
+- candidateに遷移して、electionを開始する:
+  - `currentTerm++`
+  - 自身にvote
+  - election timerのリセット
+  - RequestVote RPCを全ノードに送る
+- 過半数のノードから投票されたらleaderに遷移
+- AppendEntries RPCが新しいleaderから送られてきたら、followerに遷移
+- election timeout時間経過したら、新しいelectionを開始
+
+##### Leaders
+
+- electionまでは、空のAppendEntries RPCをハートビートとして各ノードに送る
+- クライアントからcommandを受け取ったら、ローカルのlogに適用して、state machineに適用してから返答する
+- leaderの最後のlogインデックスがfollowerのnextIndex以上だったら、nextIndexから始まるlogを載せてAppendEntries RPCを送る
+  - 成功したら、followerのnextIndexとmatchIndexを更新
+  - logの不一貫性により失敗した場合、nextIndexをデクリメントしてリトライ
+- 以下の条件全てに当てはまるNが存在したら、 `commitIndex = N`
+  - N > commitIndex
+  - 過半数のmatchIndex[i] >= N
+  - log[N].term == currentTerm
 
 ### Raft basics
 
