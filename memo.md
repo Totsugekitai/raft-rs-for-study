@@ -180,3 +180,40 @@ raftを実装する上での論文メモです。
 - followerのlogがleaderと一貫していない場合、AppendEntriesの一貫性チェックは次のAppendEntries RPCで失敗する
 - 拒否された後は、leaderはnextIndexの値をデクリメントし、AppendEntries RPCを再送する
   - これを繰り返すことで、leaderとfollowerのlogが一貫するポイントまで戻ることになる
+
+(最適化は一旦スルー)
+
+### Safety
+
+#### Election restriction
+
+- Raftは以下を保証することでシンプルになっている
+  - electionの瞬間には新しいleaderに対して過去の全てのcommitされたエントリを保証
+  - それらのエントリはleaderに新たに転送する必要はない
+    - logエントリはleaderからfollowerにしか流れないかつleaderはlogに存在するエントリを上書きすることはないため
+
+- Raftはcandidateがelectionで全てのcommitされたエントリを含んだlogを持たずに勝つのを防ぐために投票プロセスを用いる
+- candidateは選ばれるためには必ず過半数のノードと通信しなくてはならない
+  - これは全てのcommitされたエントリが最低でも1つのノードにあることを意味する
+- candidateのlogが最低でも過半数のノードのlogと同じ程度に"最新"であるなら、それは全てのcommitされたエントリを持つ事になる
+- RequestVote RPCは次の制限とともに実装される
+  - RPCはcandidateのlogの情報を含む
+  - 投票者はもし自身のlogがcandidateのlogより新しかったら、そのcandidateに対して投票を避ける
+
+- logの最新性はインデックスと最後のエントリのterm値を比較して確認する
+- logの最後のエントリのtermが違う場合、あとの方のterm値がより最新である
+- logの最後のエントリのtermが同じ場合、logが長いほうがより最新である
+
+#### Committing entries from previous terms
+
+- leaderは現在のtermのあるエントリが過半数のノードにストアされていたらcommitされているということを知っている
+- leaderがエントリをcommitする前にクラッシュした場合、未来のleaderはエントリの複製を終わらせることを試行する
+  - しかしleaderは、前termのあるエントリが過半数のノードにストアされてcommitされているかすぐには結論づけることはできない
+  - Figure 8で状況に寄っては上書きされる例が示されている
+- Figure 8のような状況をなくすために、Raftは前termのエントリをcommitするかどうかは複製のカウントで決めない
+  - leaderの現在のtermからもたらされているlogエントリのみを複製のカウントでcommitするかどうか決める
+- Log Matching Propertyにより、現在のtermのあるエントリがcommitされたら、それより前のエントリは暗黙的にcommitされる
+- (より古いlogエントリはcommitされたと安全に結論づける状況もありうるが、Raftはシンプルさを重視して更に保守的な方法を取ることにする)
+
+#### Safety argument
+
