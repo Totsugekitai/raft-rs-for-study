@@ -342,3 +342,45 @@ candidateが投票を集めるために発するRPC
 
 #### Safety argument
 
+以下の状況を考える
+
+- term Tのleader(leader(T))によってT中のlogはcommitされているが、未来のtermのleaderによってストアされていない
+  - U > Tを満たす最小のUにおいてleader(U)は当該エントリをストアしていない
+
+1. commitされたエントリは、election時においてleader(U)のlog中にはない(leaderはエントリの削除/上書きはしない)
+2. leader(T)は過半数のノードにエントリを複製し、leader(U)は過半数ノードから投票を受け取る。
+   最低でも1つのサーバ(the voter)はleader(T)からエントリを受け入れ、leader(U)に投票をしている
+3. voterは leader(U)に投票する **前に** leader(T)からエントリを受け入れないといけない。
+   そうでない場合にはleader(T)からのAppendEntries RPCをrejectする(このとき currentTerm > T)。
+4. voterはエントリをストアし、leader(U)に投票する。
+5. leader(U)のlogはvoterのlogと同程度に最新のものである。
+6. voterとleader(U)が同じlogのtermを共有していた場合、つまりleader(U)のログが最低でもvoterのlogと同程度に長い場合、
+   leader(U)のlogはvoterのlogを全て含んでいる
+7. leader(U)の最後のlogのtermはvoterのそれよりも大きくなければならない。
+   さらに、それはTよりも大きい。理由は、voterの最後のlogのtermは最低でもTの大きさを持つからである。
+   leader(U)の最後のlogのtermを作った更に前のleaderはそのlogのcommitされたエントリを含んでいなければならない。
+   Log Matching Propertyにより、leader(U)のlogはそのcommitされたエントリを含んでいなければならない。
+8. これらの議論により、termがTより大きいleaderは全てtermがTのときにcommitされたエントリを全て含んでいなければならない。
+9. Log Matching Propertyは、次のことを保証する。
+   つまり、未来のleaderは間接的にcommitされたエントリを含む(Figure 8(d)のindex 2)
+
+### Follower andd candidate craches
+
+- followerかcandidateがクラッシュしたら、RequestVote RPCとAppendEntries RPCは失敗する
+  - 無期限にリトライする
+- クラッシュしたサーバが復帰したら、RPCは成功する
+- RPCは完了したが、返答する前にクラッシュした場合、復帰した際にもいうちど同じRPCを受け取る
+  - RaftのRPCはべき等なので、特に害はない
+  - ex. followerが既に自身のlog中にあるエントリをAppendEntries RPCで受け取っても無視される
+
+### Timing and availability
+
+- Raftは以下のタイミング要求を満たす
+  - broadcastTime << electionTimeout << MTBF
+    - broadcastTimeは各サーバにRPCを送って返答をもらうまでの平均時間
+      - 0.5ms ~ 20ms
+    - electionTimeoutはsection 5.2で解説済み
+      - 10ms ~ 500ms
+    - MTBFは一つのサーバがfailureになるまでの平均時間
+      - 数ヶ月単位
+    - "<<"は、「桁違いに大きい」を表している
